@@ -441,6 +441,7 @@ class ZonaTech_NG {
             'ajax_url' => admin_url('admin-ajax.php'),
             'site_url' => site_url(),
             'nonce' => wp_create_nonce('zonatech_nonce'),
+            'login_token' => class_exists('ZonaTech_User_Auth') ? ZonaTech_User_Auth::generate_login_token() : '',
             'paystack_public_key' => ZONATECH_PAYSTACK_PUBLIC_KEY,
             'paystack_configured' => !empty(ZONATECH_PAYSTACK_PUBLIC_KEY),
             'subject_price' => ZONATECH_SUBJECT_PRICE,

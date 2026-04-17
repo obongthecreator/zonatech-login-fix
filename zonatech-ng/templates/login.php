@@ -7,6 +7,12 @@ if (!defined('ABSPATH')) exit;
 
 // Check for session expired message
 $session_expired = isset($_GET['session_expired']) && $_GET['session_expired'] == '1';
+
+// Generate a login token independent of WordPress nonces
+$login_token = '';
+if (class_exists('ZonaTech_User_Auth')) {
+    $login_token = ZonaTech_User_Auth::generate_login_token();
+}
 ?>
 
 <div class="zonatech-container">
@@ -88,6 +94,7 @@ $session_expired = isset($_GET['session_expired']) && $_GET['session_expired'] =
             <?php endif; ?>
             
             <form id="zonatech-login-form">
+                <input type="hidden" name="login_token" value="<?php echo esc_attr($login_token); ?>">
                 <div class="form-group">
                     <label for="email" class="text-white"><i class="fas fa-envelope"></i> Email Address</label>
                     <input type="email" name="email" id="email" class="form-control" placeholder="Enter your email" required>

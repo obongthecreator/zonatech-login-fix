@@ -42,9 +42,8 @@
                 const form = $(this);
                 const submitBtn = form.find('button[type="submit"]');
                 const originalText = submitBtn.html();
-                const nonceRetry = form.data('nonce-retry') === true;
+                
                 const handleLoginError = (message) => {
-                    form.removeData('nonce-retry');
                     showNotification(message || 'Login failed. Please try again.', 'error');
                     submitBtn.prop('disabled', false).html(originalText);
                 };
@@ -54,102 +53,172 @@
                 
                 submitBtn.prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Logging in...');
                 
-                const data = {
-                    action: 'zonatech_login',
-                    nonce: zonatech_ajax.nonce,
-                    email: $.trim(form.find('[name="email"]').val()),
-                    password: form.find('[name="password"]').val(),
-                    remember: form.find('[name="remember"]').is(':checked') ? 'true' : 'false'
-                };
+                const email = $.trim(form.find('[name="email"]').val());
+                const password = form.find('[name="password"]').val();
+                const remember = form.find('[name="remember"]').is(':checked') ? 'true' : 'false';
+                const loginToken = form.find('[name="login_token"]').val() || '';
                 
                 // Client-side validation
-                if (!data.email || !data.password) {
+                if (!email || !password) {
                     handleLoginError('Email and password are required.');
                     return;
                 }
                 
+                // Step 1: Try primary login with WordPress nonce
+                const primaryData = {
+                    action: 'zonatech_login',
+                    nonce: zonatech_ajax.nonce,
+                    email: email,
+                    password: password,
+                    remember: remember
+                };
+                
                 $.ajax({
                     url: zonatech_ajax.ajax_url,
                     type: 'POST',
-                    data: data,
+                    data: primaryData,
                     dataType: 'json',
                     timeout: 30000,
                     success: function(response) {
                         if (response.success) {
-                            form.removeData('nonce-retry');
                             showNotification(response.data.message || 'Login successful!', 'success');
                             setTimeout(function() {
                                 window.location.href = response.data.redirect;
                             }, 1000);
                         } else {
-                            const errorCode = response.data && response.data.code ? response.data.code : '';
+                            var errorCode = response.data && response.data.code ? response.data.code : '';
+                            
                             if (errorCode === 'nonce_invalid') {
-                                if (nonceRetry) {
-                                    handleLoginError(response.data.message);
-                                    return;
-                                }
-                                ZonaTechAuth.refreshNonce().done(function(result) {
-                                    if (result && result.data && result.data.nonce) {
-                                        zonatech_ajax.nonce = result.data.nonce;
-                                        form.data('nonce-retry', true);
-                                        form.trigger('submit');
-                                        return;
-                                    }
-                                    handleLoginError(response.data.message);
-                                }).fail(function() {
-                                    handleLoginError(response.data.message);
-                                });
-                                return;
+                                // Nonce is stale — try refreshing it first
+                                ZonaTechAuth.attemptNonceRefreshAndRetry(form, email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+                            } else {
+                                handleLoginError(response.data ? response.data.message : 'Login failed.');
                             }
-                            handleLoginError(response.data.message);
                         }
                     },
-                    error: function(xhr, status, error) {
-                        console.error('Login error:', status, error);
-                        let errorMessage = 'An error occurred. Please try again.';
-                        
-                        if (status === 'timeout') {
-                            errorMessage = 'Request timed out. Please check your connection and try again.';
-                        } else if (xhr.status === 0) {
-                            errorMessage = 'No internet connection. Please check your network.';
-                        } else if (xhr.status === 403) {
-                            errorMessage = 'Session expired. Please refresh the page and try again.';
-                        } else if (xhr.status >= 500) {
-                            errorMessage = 'Server error. Please try again later.';
-                        }
-                        
+                    error: function(xhr, status) {
+                        // On network/server error with nonce issue, try fallback
+                        var errorCode = '';
                         if (xhr.responseText) {
                             try {
-                                const response = JSON.parse(xhr.responseText);
-                                if (response && response.data && response.data.message) {
-                                    errorMessage = response.data.message;
-                                    const errorCode = response.data.code || '';
-                                    if (errorCode === 'nonce_invalid') {
-                                        if (nonceRetry) {
-                                            handleLoginError(errorMessage);
-                                            return;
-                                        }
-                                        ZonaTechAuth.refreshNonce().done(function(result) {
-                                            if (result && result.data && result.data.nonce) {
-                                                zonatech_ajax.nonce = result.data.nonce;
-                                                form.data('nonce-retry', true);
-                                                form.trigger('submit');
-                                            } else {
-                                                handleLoginError(errorMessage);
-                                            }
-                                        }).fail(function() {
-                                            handleLoginError('Session expired. Please refresh the page.');
-                                        });
-                                        return;
-                                    }
-                                }
-                            } catch (parseError) {
-                                console.warn('Failed to parse error response:', parseError);
-                            }
+                                var resp = JSON.parse(xhr.responseText);
+                                errorCode = resp.data && resp.data.code ? resp.data.code : '';
+                            } catch (e) { /* ignore parse error */ }
                         }
-                        handleLoginError(errorMessage);
+                        
+                        if (errorCode === 'nonce_invalid' || status === 'timeout' || xhr.status === 403) {
+                            // Try the fallback direct login endpoint
+                            ZonaTechAuth.attemptDirectLogin(email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+                        } else {
+                            var errorMessage = 'An error occurred. Please try again.';
+                            if (status === 'timeout') {
+                                errorMessage = 'Request timed out. Please check your connection.';
+                            } else if (xhr.status === 0) {
+                                errorMessage = 'No internet connection. Please check your network.';
+                            } else if (xhr.status >= 500) {
+                                errorMessage = 'Server error. Please try again later.';
+                            }
+                            handleLoginError(errorMessage);
+                        }
                     }
                 });
+            });
+        },
+        
+        // Attempt to refresh nonce and retry login
+        attemptNonceRefreshAndRetry: function(form, email, password, remember, loginToken, submitBtn, originalText, handleLoginError) {
+            ZonaTechAuth.refreshNonce().done(function(result) {
+                if (result && result.success && result.data && result.data.nonce) {
+                    zonatech_ajax.nonce = result.data.nonce;
+                    
+                    // Retry login with fresh nonce
+                    $.ajax({
+                        url: zonatech_ajax.ajax_url,
+                        type: 'POST',
+                        data: {
+                            action: 'zonatech_login',
+                            nonce: zonatech_ajax.nonce,
+                            email: email,
+                            password: password,
+                            remember: remember
+                        },
+                        dataType: 'json',
+                        timeout: 30000,
+                        success: function(response) {
+                            if (response.success) {
+                                showNotification(response.data.message || 'Login successful!', 'success');
+                                setTimeout(function() {
+                                    window.location.href = response.data.redirect;
+                                }, 1000);
+                            } else {
+                                // Nonce refresh worked but login still failed — use direct endpoint
+                                ZonaTechAuth.attemptDirectLogin(email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+                            }
+                        },
+                        error: function() {
+                            ZonaTechAuth.attemptDirectLogin(email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+                        }
+                    });
+                } else {
+                    // Nonce refresh failed — go straight to direct login
+                    ZonaTechAuth.attemptDirectLogin(email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+                }
+            }).fail(function() {
+                ZonaTechAuth.attemptDirectLogin(email, password, remember, loginToken, submitBtn, originalText, handleLoginError);
+            });
+        },
+        
+        // Fallback: direct login endpoint that doesn't require WordPress nonces
+        attemptDirectLogin: function(email, password, remember, loginToken, submitBtn, originalText, handleLoginError) {
+            // Use login_token from form field, localized data, or empty string
+            var token = loginToken || (typeof zonatech_ajax !== 'undefined' ? zonatech_ajax.login_token : '') || '';
+            $.ajax({
+                url: zonatech_ajax.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'zonatech_login_direct',
+                    login_token: token,
+                    email: email,
+                    password: password,
+                    remember: remember
+                },
+                dataType: 'json',
+                timeout: 30000,
+                success: function(response) {
+                    if (response.success) {
+                        // Update nonce for future requests if provided
+                        if (response.data.new_nonce) {
+                            zonatech_ajax.nonce = response.data.new_nonce;
+                        }
+                        showNotification(response.data.message || 'Login successful!', 'success');
+                        setTimeout(function() {
+                            window.location.href = response.data.redirect;
+                        }, 1000);
+                    } else {
+                        handleLoginError(response.data ? response.data.message : 'Login failed. Please try again.');
+                    }
+                },
+                error: function(xhr, status) {
+                    var errorMessage = 'Login failed. Please refresh the page and try again.';
+                    if (status === 'timeout') {
+                        errorMessage = 'Request timed out. Please check your connection.';
+                    } else if (xhr.status === 0) {
+                        errorMessage = 'No internet connection. Please check your network.';
+                    } else if (xhr.status >= 500) {
+                        errorMessage = 'Server error. Please try again later.';
+                    }
+                    
+                    if (xhr.responseText) {
+                        try {
+                            var resp = JSON.parse(xhr.responseText);
+                            if (resp.data && resp.data.message) {
+                                errorMessage = resp.data.message;
+                            }
+                        } catch (e) { /* ignore parse error */ }
+                    }
+                    
+                    handleLoginError(errorMessage);
+                }
             });
         },
         

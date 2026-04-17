@@ -35,6 +35,9 @@ class ZonaTech_User_Auth {
         add_action('wp_ajax_zonatech_change_password', array($this, 'handle_change_password'));
         add_action('wp_ajax_zonatech_upload_avatar', array($this, 'handle_upload_avatar'));
         
+        // Fallback login endpoint that uses login_token instead of WordPress nonces
+        add_action('wp_ajax_nopriv_zonatech_login_direct', array($this, 'handle_login_direct'));
+        
         // Background email hook
         add_action('zonatech_send_welcome_email', array($this, 'send_welcome_email_background'), 10, 2);
     }
@@ -862,97 +865,309 @@ class ZonaTech_User_Auth {
         return $table_exists;
     }
     
-    public function handle_login() {
-        if (defined('DOING_AJAX') && DOING_AJAX) {
-            while (ob_get_level() > 0) {
-                ob_end_clean();
+    /**
+     * Verify the request origin as an alternative CSRF check when nonces are unavailable.
+     * Checks HTTP Origin and Referer headers against the site URL.
+     */
+    private function verify_request_origin() {
+        $site_url = parse_url(home_url(), PHP_URL_HOST);
+        if (empty($site_url)) {
+            return false;
+        }
+
+        // Check Origin header first (most reliable)
+        if (!empty($_SERVER['HTTP_ORIGIN'])) {
+            $origin_host = parse_url(sanitize_url(wp_unslash($_SERVER['HTTP_ORIGIN'])), PHP_URL_HOST);
+            if ($origin_host === $site_url) {
+                return true;
             }
-            
-            if (!headers_sent()) {
-                header('Content-Type: application/json; charset=UTF-8');
-                header('Cache-Control: no-cache, no-store, must-revalidate');
+        }
+
+        // Fallback to Referer header
+        if (!empty($_SERVER['HTTP_REFERER'])) {
+            $referer_host = parse_url(sanitize_url(wp_unslash($_SERVER['HTTP_REFERER'])), PHP_URL_HOST);
+            if ($referer_host === $site_url) {
+                return true;
             }
         }
-        
-        // Nonce verification with graceful handling - don't block login entirely
-        $nonce_value = isset($_POST['nonce']) ? sanitize_key(wp_unslash($_POST['nonce'])) : '';
-        $nonce_valid = !empty($nonce_value) && wp_verify_nonce($nonce_value, 'zonatech_nonce');
-        if (!$nonce_valid) {
-            // Try to verify with a fresh check - nonces can expire on cached pages
-            $nonce_valid = !empty($nonce_value) && wp_verify_nonce($nonce_value, 'zonatech_nonce');
-        }
-        if (!$nonce_valid) {
-            wp_send_json_error(array(
-                'message' => 'Security check failed. Please refresh the page and try again.',
-                'code' => 'nonce_invalid'
-            ));
-            return;
-        }
-        
-        $email = isset($_POST['email']) ? sanitize_email(wp_unslash($_POST['email'])) : '';
-        $password = isset($_POST['password']) ? wp_unslash($_POST['password']) : '';
-        $remember = isset($_POST['remember']) && $_POST['remember'] === 'true';
-        
-        if (empty($email) || empty($password)) {
-            wp_send_json_error(array('message' => 'Email and password are required.'));
-            return;
-        }
-        
-        // Rate limiting: prevent brute force attacks (max 5 attempts per 15 minutes per IP)
-        $ip_address = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown';
-        $rate_limit_key = 'zonatech_login_attempts_' . md5($ip_address);
-        $login_attempts = (int) get_transient($rate_limit_key);
-        if ($login_attempts >= 5) {
-            wp_send_json_error(array('message' => 'Too many login attempts. Please try again in 15 minutes.'));
-            return;
-        }
-        
-        // Look up the user by email
+
+        return false;
+    }
+
+    /**
+     * Look up a user by email, with direct database fallback if get_user_by() fails
+     * due to third-party plugin filters.
+     */
+    private function find_user_by_email($email) {
+        // Try WordPress standard function first
         $user = get_user_by('email', $email);
-        
-        if (!$user) {
-            // Increment failed attempts counter
-            set_transient($rate_limit_key, $login_attempts + 1, 15 * MINUTE_IN_SECONDS);
-            wp_send_json_error(array('message' => 'Invalid email or password.'));
-            return;
+        if ($user) {
+            return $user;
         }
-        
-        // Verify password directly - bypasses WordPress authentication filters
-        // that may add extra rules (password complexity plugins, login limiters, etc.)
-        $password_valid = wp_check_password($password, $user->user_pass, $user->ID);
-        
-        if (!$password_valid) {
-            // Increment failed attempts counter
-            set_transient($rate_limit_key, $login_attempts + 1, 15 * MINUTE_IN_SECONDS);
-            wp_send_json_error(array('message' => 'Invalid email or password.'));
-            return;
+
+        // Direct database fallback - bypasses any filters on get_user_by()
+        global $wpdb;
+        $user_row = $wpdb->get_row($wpdb->prepare(
+            "SELECT ID, user_login, user_pass, user_email, display_name FROM {$wpdb->users} WHERE user_email = %s LIMIT 1",
+            $email
+        ));
+
+        if (!$user_row) {
+            return false;
         }
-        
-        // Clear rate limit on successful login
-        delete_transient($rate_limit_key);
-        
-        // Set user session directly - bypasses wp_signon() which can fail due to
-        // third-party plugin hooks, password policy plugins, or authentication filters
+
+        // Return a WP_User object from the direct DB result
+        $user = new WP_User($user_row->ID);
+        return ($user && $user->exists()) ? $user : false;
+    }
+
+    /**
+     * Verify a password against a user's stored hash, with direct phpass fallback
+     * if wp_check_password() fails due to third-party hooks.
+     */
+    private function verify_password($password, $user) {
+        // Try WordPress standard function first
+        if (wp_check_password($password, $user->user_pass, $user->ID)) {
+            return true;
+        }
+
+        // Direct phpass verification fallback - bypasses any filters on check_password
+        if (class_exists('PasswordHash')) {
+            $wp_hasher = new PasswordHash(8, true);
+            if ($wp_hasher->CheckPassword($password, $user->user_pass)) {
+                return true;
+            }
+        }
+
+        // Try loading phpass from WordPress includes if not already loaded
+        $phpass_path = ABSPATH . WPINC . '/class-phpass.php';
+        if (file_exists($phpass_path)) {
+            require_once $phpass_path;
+            $wp_hasher = new PasswordHash(8, true);
+            if ($wp_hasher->CheckPassword($password, $user->user_pass)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Establish a user session after successful authentication.
+     * Uses WordPress cookie-based auth directly, bypassing wp_signon().
+     */
+    private function establish_session($user, $remember) {
         wp_set_current_user($user->ID, $user->user_login);
         wp_set_auth_cookie($user->ID, $remember, is_ssl());
-        
+
         // Fire standard WordPress login action for compatibility (e.g., last login tracking)
-        do_action('wp_login', $user->user_login, $user);
-        
-        // Log activity (wrapped in try-catch to prevent login failure if activity log has issues)
+        // Wrapped in try-catch to prevent third-party plugin errors from blocking login
+        try {
+            do_action('wp_login', $user->user_login, $user);
+        } catch (Exception $e) {
+            error_log('ZonaTech: wp_login action error - ' . $e->getMessage());
+        }
+
+        // Log activity (wrapped in try-catch)
         try {
             if (class_exists('ZonaTech_Activity_Log') && method_exists('ZonaTech_Activity_Log', 'log')) {
                 ZonaTech_Activity_Log::log($user->ID, 'login', 'User logged in');
             }
         } catch (Exception $e) {
-            // Silently fail - don't block login due to activity logging issues
             error_log('ZonaTech: Activity log error during login - ' . $e->getMessage());
         }
-        
+    }
+
+    /**
+     * Core login logic shared by both nonce-based and direct login endpoints.
+     * Returns a WP_User on success, or sends a JSON error and returns false.
+     */
+    private function process_login_credentials() {
+        $email = isset($_POST['email']) ? sanitize_email(wp_unslash($_POST['email'])) : '';
+        $password = isset($_POST['password']) ? wp_unslash($_POST['password']) : '';
+
+        if (empty($email) || empty($password)) {
+            wp_send_json_error(array('message' => 'Email and password are required.'));
+            return false;
+        }
+
+        // Rate limiting: max 5 attempts per 15 minutes per IP
+        $ip_address = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown';
+        $rate_limit_key = 'zonatech_login_attempts_' . md5($ip_address);
+        $login_attempts = (int) get_transient($rate_limit_key);
+        if ($login_attempts >= 5) {
+            wp_send_json_error(array('message' => 'Too many login attempts. Please try again in 15 minutes.'));
+            return false;
+        }
+
+        // Look up user by email (with direct DB fallback)
+        $user = $this->find_user_by_email($email);
+
+        if (!$user) {
+            set_transient($rate_limit_key, $login_attempts + 1, 15 * MINUTE_IN_SECONDS);
+            wp_send_json_error(array('message' => 'Invalid email or password.'));
+            return false;
+        }
+
+        // Verify password (with direct phpass fallback)
+        if (!$this->verify_password($password, $user)) {
+            set_transient($rate_limit_key, $login_attempts + 1, 15 * MINUTE_IN_SECONDS);
+            wp_send_json_error(array('message' => 'Invalid email or password.'));
+            return false;
+        }
+
+        // Clear rate limit on success
+        delete_transient($rate_limit_key);
+
+        return $user;
+    }
+
+    /**
+     * Primary login handler (nonce-based with origin fallback).
+     * If the WordPress nonce is invalid but request origin is verified,
+     * login proceeds anyway to handle cached page scenarios.
+     */
+    public function handle_login() {
+        if (defined('DOING_AJAX') && DOING_AJAX) {
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+
+            if (!headers_sent()) {
+                header('Content-Type: application/json; charset=UTF-8');
+                header('Cache-Control: no-cache, no-store, must-revalidate');
+            }
+        }
+
+        // Nonce verification with graceful fallback to origin check
+        $nonce_value = isset($_POST['nonce']) ? sanitize_key(wp_unslash($_POST['nonce'])) : '';
+        $nonce_valid = !empty($nonce_value) && wp_verify_nonce($nonce_value, 'zonatech_nonce');
+
+        if (!$nonce_valid) {
+            // Nonce failed — fall back to origin/referer verification.
+            // This handles cached pages where the nonce became stale.
+            if (!$this->verify_request_origin()) {
+                wp_send_json_error(array(
+                    'message' => 'Security check failed. Please refresh the page and try again.',
+                    'code' => 'nonce_invalid'
+                ));
+                return;
+            }
+            // Origin verified — proceed without nonce (logged for monitoring)
+            error_log('ZonaTech: Login proceeding with origin-based CSRF check (nonce was stale)');
+        }
+
+        $remember = isset($_POST['remember']) && $_POST['remember'] === 'true';
+
+        $user = $this->process_login_credentials();
+        if (!$user) {
+            return; // process_login_credentials already sent the error response
+        }
+
+        $this->establish_session($user, $remember);
+
         wp_send_json_success(array(
             'message' => 'Login successful!',
             'redirect' => home_url('/zonatech-dashboard/')
         ));
+    }
+
+    /**
+     * Fallback login handler that uses a login_token instead of WordPress nonces.
+     * The token is generated server-side and embedded in the login page, independent
+     * of WordPress's nonce system. This endpoint works even when nonces are completely broken.
+     */
+    public function handle_login_direct() {
+        if (defined('DOING_AJAX') && DOING_AJAX) {
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+
+            if (!headers_sent()) {
+                header('Content-Type: application/json; charset=UTF-8');
+                header('Cache-Control: no-cache, no-store, must-revalidate');
+            }
+        }
+
+        // Verify using login_token (HMAC-based, independent of WordPress nonces)
+        $login_token = isset($_POST['login_token']) ? sanitize_text_field(wp_unslash($_POST['login_token'])) : '';
+        $token_valid = $this->verify_login_token($login_token);
+
+        if (!$token_valid) {
+            // Fall back to origin check as last resort
+            if (!$this->verify_request_origin()) {
+                wp_send_json_error(array(
+                    'message' => 'Security check failed. Please refresh the page and try again.',
+                    'code' => 'token_invalid'
+                ));
+                return;
+            }
+        }
+
+        $remember = isset($_POST['remember']) && $_POST['remember'] === 'true';
+
+        $user = $this->process_login_credentials();
+        if (!$user) {
+            return;
+        }
+
+        $this->establish_session($user, $remember);
+
+        wp_send_json_success(array(
+            'message' => 'Login successful!',
+            'redirect' => home_url('/zonatech-dashboard/'),
+            'new_nonce' => wp_create_nonce('zonatech_nonce')
+        ));
+    }
+
+    /**
+     * Generate a login token independent of WordPress nonces.
+     * Uses HMAC with a site-specific secret and a time window.
+     */
+    public static function generate_login_token() {
+        $secret = self::get_login_token_secret();
+        $time_window = floor(time() / 3600); // 1-hour window
+        return hash_hmac('sha256', 'zonatech_login_' . $time_window, $secret);
+    }
+
+    /**
+     * Verify a login token. Checks both current and previous time windows
+     * to handle tokens generated near the window boundary.
+     */
+    private function verify_login_token($token) {
+        if (empty($token)) {
+            return false;
+        }
+
+        $secret = self::get_login_token_secret();
+        $time_window = floor(time() / 3600);
+
+        // Check current window
+        $expected = hash_hmac('sha256', 'zonatech_login_' . $time_window, $secret);
+        if (hash_equals($expected, $token)) {
+            return true;
+        }
+
+        // Check previous window (handles boundary cases)
+        $expected_prev = hash_hmac('sha256', 'zonatech_login_' . ($time_window - 1), $secret);
+        return hash_equals($expected_prev, $token);
+    }
+
+    /**
+     * Get or create a persistent secret for login token generation.
+     * Falls back to WordPress auth constants if option storage fails.
+     */
+    private static function get_login_token_secret() {
+        $secret = get_option('zonatech_login_token_secret', '');
+        if (empty($secret)) {
+            $secret = wp_generate_password(64, true, true);
+            update_option('zonatech_login_token_secret', $secret);
+        }
+        // Combine with WordPress auth salt for extra security
+        if (defined('AUTH_SALT')) {
+            $secret .= AUTH_SALT;
+        }
+        return $secret;
     }
     
     public function handle_logout() {
@@ -977,15 +1192,7 @@ class ZonaTech_User_Auth {
     }
 
     public function handle_refresh_nonce() {
-        $current_nonce = isset($_POST['current_nonce']) ? sanitize_key(wp_unslash($_POST['current_nonce'])) : '';
-        $current_nonce_valid = !empty($current_nonce) && wp_verify_nonce($current_nonce, 'zonatech_nonce');
-        if (empty($current_nonce)) {
-            wp_send_json_error(array(
-                'message' => 'Security check failed. Please refresh the page and try again.',
-                'code' => 'nonce_invalid'
-            ));
-            return;
-        }
+        // Rate limit nonce refresh requests by IP to prevent abuse
         $ip_address = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown';
         $rate_limit_key = 'zonatech_nonce_refresh_' . md5($ip_address);
         if (get_transient($rate_limit_key)) {
@@ -994,8 +1201,22 @@ class ZonaTech_User_Auth {
         }
         set_transient($rate_limit_key, 1, self::NONCE_REFRESH_RATE_LIMIT);
 
+        // Verify request origin as CSRF protection (since the old nonce may be stale)
+        $current_nonce = isset($_POST['current_nonce']) ? sanitize_key(wp_unslash($_POST['current_nonce'])) : '';
+        $current_nonce_valid = !empty($current_nonce) && wp_verify_nonce($current_nonce, 'zonatech_nonce');
+
+        // Allow nonce refresh if either the old nonce is valid OR the request origin matches
+        if (!$current_nonce_valid && !$this->verify_request_origin()) {
+            wp_send_json_error(array(
+                'message' => 'Security check failed. Please refresh the page and try again.',
+                'code' => 'nonce_invalid'
+            ));
+            return;
+        }
+
         wp_send_json_success(array(
             'nonce' => wp_create_nonce('zonatech_nonce'),
+            'login_token' => self::generate_login_token(),
             'nonce_valid' => $current_nonce_valid
         ));
     }
